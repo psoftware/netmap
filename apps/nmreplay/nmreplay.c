@@ -126,6 +126,7 @@
 #include <sys/resource.h> // setpriority
 #include <sys/time.h>
 #include <unistd.h>
+#include <ctrs.h>
 
 /*
  *
@@ -438,11 +439,12 @@ readpcap(const char *fn)
 enum my_pcap_mode { PM_NONE, PM_FAST, PM_FIXED, PM_REAL };
 
 static int verbose = 0;
-
+static int normalize = 1;
 static int do_abort = 0;
 
 #ifdef linux
 #define cpuset_t        cpu_set_t
+#define CLOCK_REALTIME_PRECISE CLOCK_REALTIME
 #endif
 
 #ifdef __APPLE__
@@ -610,6 +612,10 @@ struct _qs { /* shared queue */
 		 * bumps the output time as needed.
 		 */
 
+        #define STATS_WIN       15
+        int win_idx;
+        int64_t win[STATS_WIN];
+
 
 	/* consumer's fields */
 	const char *		cons_ifname;
@@ -622,10 +628,15 @@ struct _qs { /* shared queue */
 	/* shared fields */
 	volatile uint64_t _tail ALIGN_CACHE ;	/* producer writes here */
 	volatile uint64_t _head ALIGN_CACHE ;	/* consumer reads from here */
+
+        /* consumer writes, producer reads */
+        volatile struct my_ctrs ctr ALIGN_CACHE;                /* absolute stats */
+        struct timespec cons_start_t, cons_stop_t;     /* cons start/end time */
 };
 
 struct pipe_args {
 	int		wait_link;
+	int		do_wind_stats;
 
 	pthread_t	cons_tid;	/* main thread */
 	pthread_t	prod_tid;	/* producer thread */
@@ -854,12 +865,21 @@ cons(void *_pa)
     int pending = 0;
     uint64_t last_ts = 0;
 
+    /* stats */
+    uint64_t st_events = 0;  /* for batching        */
+    uint64_t st_txn = 0;     /* count transmitted   */
+    uint64_t st_txbytes = 0; /* count transm. bytes */
+
     /* read the start of times in q->t0 */
     set_tns_now(&q->t0, 0);
     /* set the time (cons_now) to clock - q->t0 */
     set_tns_now(&q->cons_now, q->t0);
     q->cons_head = q->_head;
     q->cons_tail = q->_tail;
+
+    /* set start time for stats */
+    clock_gettime(CLOCK_REALTIME_PRECISE, &q->cons_start_t);
+
     while (!do_abort) { /* consumer, infinite */
 	struct q_pkt *p = pkt_at(q, q->cons_head);
 
@@ -882,29 +902,46 @@ cons(void *_pa)
 	    /* the ioctl should be conditional */
 	    ioctl(pa->pb->fd, NIOCTXSYNC, 0); // XXX just in case
 	    pending = 0;
+	    st_events++;
 	    usleep(20);
 	    set_tns_now(&q->cons_now, q->t0);
 	    continue;
 	}
 	/* XXX copy is inefficient but simple */
 	if (nmport_inject(pa->pb, (char *)(p + 1), p->pktlen) == 0) {
-	    RD(1, "inject failed len %d now %ld tx %ld h %ld t %ld next %ld",
-		(int)p->pktlen, (u_long)q->cons_now, (u_long)p->pt_tx,
-		(u_long)q->_head, (u_long)q->_tail, (u_long)p->next);
+	    if (verbose)
+	        RD(1, "inject failed len %d now %ld tx %ld h %ld t %ld next %ld",
+		    (int)p->pktlen, (u_long)q->cons_now, (u_long)p->pt_tx,
+		    (u_long)q->_head, (u_long)q->_tail, (u_long)p->next);
 	    ioctl(pa->pb->fd, NIOCTXSYNC, 0);
 	    pending = 0;
+	    st_events++;
 	    continue;
 	}
+
+	st_txn++;
+	st_txbytes += p->pktlen;
+
 	pending++;
 	if (pending > q->burst) {
 	    ioctl(pa->pb->fd, NIOCTXSYNC, 0);
 	    pending = 0;
+	    st_events++;
+
+	    /* Those are slooooow (volatile) */
+	    q->ctr.pkts = st_txn;
+	    q->ctr.bytes = st_txbytes;
+	    q->ctr.events = st_events;
+	    /********************/
 	}
 
 	q->cons_head = p->next;
 	/* drain packets from the queue */
 	q->rx++;
     }
+
+    /* set stop time for stats */
+    clock_gettime(CLOCK_REALTIME_PRECISE, &q->cons_stop_t);
     D("exiting on abort");
     return NULL;
 }
@@ -968,7 +1005,7 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: nmreplay [-v] [-D delay] [-B {[constant,]bps|ether,bps|real,speedup}] [-L loss]\n"
-	    "\t[-b burst] -f pcap-file -i <netmap:ifname|valeSSS:PPP>\n");
+	    "\t[-b burst] [-A] -f pcap-file -i <netmap:ifname|valeSSS:PPP>\n");
 	exit(1);
 }
 
@@ -1099,6 +1136,155 @@ add_to(const char ** v, int l, const char *arg, const char *msg)
 	*v = arg;
 }
 
+static void
+tx_output(struct my_ctrs *cur, double delta, const char *msg)
+{
+    double bw, raw_bw, pps, abs;
+    char b1[40], b2[80], b3[80];
+    int size;
+
+    if (cur->pkts == 0) {
+            printf("%s nothing.\n", msg);
+            return;
+    }
+
+    size = (int)(cur->bytes / cur->pkts);
+
+    printf("%s %llu packets %llu bytes %llu events %d bytes each in %.2f seconds.\n",
+            msg,
+            (unsigned long long)cur->pkts,
+            (unsigned long long)cur->bytes,
+            (unsigned long long)cur->events, size, delta);
+    if (delta == 0)
+            delta = 1e-6;
+    if (size < 60)          /* correct for min packet size */
+            size = 60;
+    pps = cur->pkts / delta;
+    bw = (8.0 * cur->bytes) / delta;
+    raw_bw = (8.0 * cur->bytes + cur->pkts) / delta;
+    abs = cur->pkts / (double)(cur->events);
+
+    printf("Speed: %spps Bandwidth: %sbps (raw %sbps). Average batch: %.2f pkts\n",
+            norm(b1, pps, normalize), norm(b2, bw, normalize), norm(b3, raw_bw, normalize), abs);
+}
+
+int
+report_body(struct pipe_args *bp) {
+    struct my_ctrs prev, cur;
+    double delta_t;
+    struct _qs *q0 = &bp[0].q;
+    int i;
+
+    prev.pkts = prev.bytes = prev.events = 0;
+    //gettimeofday(&prev.t, NULL);
+    prev.t = timespec2val(&q0->cons_start_t);
+
+    while (!do_abort) {
+        struct _qs olda = bp[0].q;
+
+        char b1[40], b2[40], b3[40], b4[100];
+        uint64_t pps, usec;
+        struct my_ctrs x;
+        double abs;
+
+        usec = wait_for_next_report(&prev.t, &cur.t, 1000);
+
+        if(verbose) {
+            ED("%lld -> %lld maxq %d round %lld",
+                (long long)(q0->rx - olda.rx), (long long)(q0->tx - olda.tx),
+                q0->rx_qmax, (long long)q0->prod_max_gap);
+            ED("plr nominal %le actual %le",
+                (double)(q0->c_loss.d[0])/(1<<24),
+                q0->c_loss.d[1] == 0 ? 0 :
+                (double)(q0->c_loss.d[2])/q0->c_loss.d[1]);
+        }
+        bp[0].q.rx_qmax = (bp[0].q.rx_qmax * 7)/8; // ewma
+        bp[0].q.prod_max_gap = (bp[0].q.prod_max_gap * 7)/8; // ewma
+
+        cur.pkts = cur.bytes = cur.events = 0;
+        if (usec < 10000) /* too short to be meaningful */
+                continue;
+
+        /* get stats from consumer thread */
+        cur.pkts = q0->ctr.pkts;
+        cur.bytes = q0->ctr.bytes;
+        cur.events = q0->ctr.events;
+
+        x.pkts = cur.pkts - prev.pkts;
+        x.bytes = cur.bytes - prev.bytes;
+        x.events = cur.events - prev.events;
+
+        pps = (x.pkts*1000000 + usec/2) / usec;
+        abs = (x.events > 0) ? (x.pkts / (double) x.events) : 0;
+
+        if (!bp[0].do_wind_stats) {
+                strcpy(b4, "");
+        } else {
+            /* Compute some pps stats using a sliding window. */
+            double ppsavg = 0.0, ppsdev = 0.0;
+            int nsamples = 0;
+
+            q0->win[q0->win_idx] = pps;
+            q0->win_idx = (q0->win_idx + 1) % STATS_WIN;
+
+            for (i = 0; i < STATS_WIN; i++) {
+                ppsavg += q0->win[i];
+                if (q0->win[i]) {
+                        nsamples ++;
+                }
+            }
+            ppsavg /= nsamples;
+
+            for (i = 0; i < STATS_WIN; i++) {
+                if (q0->win[i] == 0) {
+                        continue;
+                }
+                ppsdev += (q0->win[i] - ppsavg) * (q0->win[i] - ppsavg);
+            }
+            ppsdev /= nsamples;
+            ppsdev = sqrt(ppsdev);
+
+            snprintf(b4, sizeof(b4), "[avg/std %s/%s pps]",
+                 norm(b1, ppsavg, normalize), norm(b2, ppsdev, normalize));
+        }
+
+        D("%spps %s(%spkts %sbps in %llu usec) %.2f avg_batch",
+            norm(b1, pps, normalize), b4,
+            norm(b2, (double)x.pkts, normalize),
+            norm(b3, 1000000*((double)x.bytes*8)/usec, normalize),
+            (unsigned long long)usec, abs);
+        prev = cur;
+
+    }
+    D("exiting on abort");
+
+    /* final round */
+    struct timeval start_t, stop_t, diff_t;
+    cur.pkts = cur.bytes = cur.events = 0;
+
+    /* join consumer */
+    pthread_join(bp[0].cons_tid, NULL); /* blocking */
+
+    /*
+     * Collect consumer output and extract information about
+     * how long it took to send all the packets.
+     */
+    cur.pkts = q0->ctr.pkts;
+    cur.bytes = q0->ctr.bytes;
+    cur.events = q0->ctr.events;
+    start_t = timespec2val(&q0->cons_start_t);
+    stop_t = timespec2val(&q0->cons_stop_t);
+
+    /* print output. */
+    timersub(&stop_t, &start_t, &diff_t);
+    delta_t = diff_t.tv_sec + 1e-6* diff_t.tv_usec;
+    tx_output(&cur, delta_t, "Sent");
+
+    sleep(1);
+
+    return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1143,8 +1329,9 @@ main(int argc, char **argv)
 	// b	batch size
 	// v	verbose
 	// C	cpu placement
+	// A    compute window avg/std
 
-	while ( (ch = getopt(argc, argv, "B:C:D:L:b:f:i:vw:")) != -1) {
+	while ( (ch = getopt(argc, argv, "B:C:D:L:b:f:i:vw:A")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1204,6 +1391,9 @@ main(int argc, char **argv)
 		case 'v':
 			verbose++;
 			break;
+		case 'A':
+			bp[0].do_wind_stats = 1;
+			break;
 		case 'w':
 			bp[0].wait_link = atoi(optarg);
 			break;
@@ -1254,24 +1444,8 @@ main(int argc, char **argv)
 	pthread_create(&bp[0].cons_tid, NULL, nmreplay_main, (void*)&bp[0]);
 	signal(SIGINT, sigint_h);
 	sleep(1);
-	while (!do_abort) {
-	    struct _qs olda = bp[0].q;
-	    struct _qs *q0 = &bp[0].q;
 
-	    sleep(1);
-	    ED("%lld -> %lld maxq %d round %lld",
-		(long long)(q0->rx - olda.rx), (long long)(q0->tx - olda.tx),
-		q0->rx_qmax, (long long)q0->prod_max_gap
-		);
-	    ED("plr nominal %le actual %le",
-		(double)(q0->c_loss.d[0])/(1<<24),
-		q0->c_loss.d[1] == 0 ? 0 :
-		(double)(q0->c_loss.d[2])/q0->c_loss.d[1]);
-	    bp[0].q.rx_qmax = (bp[0].q.rx_qmax * 7)/8; // ewma
-	    bp[0].q.prod_max_gap = (bp[0].q.prod_max_gap * 7)/8; // ewma
-	}
-	D("exiting on abort");
-	sleep(1);
+	report_body(bp);
 
 	return (0);
 }
