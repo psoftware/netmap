@@ -636,6 +636,7 @@ struct _qs { /* shared queue */
 
 struct pipe_args {
 	int		wait_link;
+	uint64_t	pkt_limit;
 	int		do_wind_stats;
 
 	pthread_t	cons_tid;	/* main thread */
@@ -938,6 +939,16 @@ cons(void *_pa)
 	q->cons_head = p->next;
 	/* drain packets from the queue */
 	q->rx++;
+
+	/* num packet limiter */
+	if(pa->pkt_limit && q->rx >= pa->pkt_limit) {
+	    q->ctr.pkts = st_txn;
+	    q->ctr.bytes = st_txbytes;
+	    q->ctr.events = st_events;
+	    /* ensure stats are written before aborting */
+	    __atomic_thread_fence(__ATOMIC_RELEASE);
+	    do_abort = 1;
+	}
     }
 
     /* set stop time for stats */
@@ -1005,7 +1016,7 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage: nmreplay [-v] [-D delay] [-B {[constant,]bps|ether,bps|real,speedup}] [-L loss]\n"
-	    "\t[-b burst] [-A] -f pcap-file -i <netmap:ifname|valeSSS:PPP>\n");
+	    "\t[-b burst] [-A] [-N pktlimit] -f pcap-file -i <netmap:ifname|valeSSS:PPP>\n");
 	exit(1);
 }
 
@@ -1206,6 +1217,8 @@ report_body(struct pipe_args *bp) {
                 continue;
 
         /* get stats from consumer thread */
+        /* ensure to read do_abort before reading stats to not miss ending values */
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);
         cur.pkts = q0->ctr.pkts;
         cur.bytes = q0->ctr.bytes;
         cur.events = q0->ctr.events;
@@ -1331,7 +1344,7 @@ main(int argc, char **argv)
 	// C	cpu placement
 	// A    compute window avg/std
 
-	while ( (ch = getopt(argc, argv, "B:C:D:L:b:f:i:vw:A")) != -1) {
+	while ( (ch = getopt(argc, argv, "B:C:D:L:b:f:i:vw:AN:")) != -1) {
 		switch (ch) {
 		default:
 			D("bad option %c %s", ch, optarg);
@@ -1393,6 +1406,9 @@ main(int argc, char **argv)
 			break;
 		case 'A':
 			bp[0].do_wind_stats = 1;
+			break;
+		case 'N':
+			bp[0].pkt_limit = atoi(optarg);
 			break;
 		case 'w':
 			bp[0].wait_link = atoi(optarg);
